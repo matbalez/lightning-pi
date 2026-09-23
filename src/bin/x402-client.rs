@@ -24,10 +24,13 @@ use std::{
 };
 
 #[derive(Parser)]
-#[command(about = "Pay an x402 Lightning endpoint with validated, recoverable state")]
+#[command(
+    name = "x402-client",
+    about = "Pay an x402 Lightning endpoint with validated, recoverable state"
+)]
 struct Cli {
     /// Private journal file; never commit or upload it.
-    #[arg(long, global = true)]
+    #[arg(long)]
     state: PathBuf,
     #[command(subcommand)]
     command: Command,
@@ -61,6 +64,11 @@ enum Command {
     AttachResult {
         #[arg(long)]
         payment_result: PathBuf,
+    },
+    /// Import a completed payment from MDK agent-wallet payments JSON.
+    AttachMdk {
+        #[arg(long)]
+        payments_file: PathBuf,
     },
     /// Redeem the saved proof without paying again.
     Redeem,
@@ -198,7 +206,38 @@ fn attach(path: &Path, mut s: Value, result: Value) -> Result<()> {
     Ok(())
 }
 fn adapter_result(payment: Payment) -> Value {
-    json!({"status":if payment.status==PaymentStatus::Completed {"paid"} else if payment.status==PaymentStatus::Pending {"in_flight"} else {"failed"},"invoice":payment.invoice.map(|i|i.to_string()),"paymentHash":payment.hash.map(|h|h.to_string()),"amountMsat":payment.amount.map(|a|a.msat().to_string()),"feeMsat":payment.fees.msat().to_string(),"preimage":payment.preimage.map(|p|p.to_string())})
+    // Lexe deliberately redacts PaymentPreimage's Display implementation.
+    // Its Serialize implementation emits the actual hex proof for the wire.
+    json!({"status":if payment.status==PaymentStatus::Completed {"paid"} else if payment.status==PaymentStatus::Pending {"in_flight"} else {"failed"},"invoice":payment.invoice.map(|i|i.to_string()),"paymentHash":payment.hash.map(|h|h.to_string()),"amountMsat":payment.amount.map(|a|a.msat().to_string()),"feeMsat":payment.fees.msat().to_string(),"preimage":payment.preimage})
+}
+
+fn mdk_result(state: &Value, history: &Value) -> Result<Value> {
+    let invoice = state["accepted"]["extra"]["invoice"]
+        .as_str()
+        .context("Missing invoice")?;
+    let records = history["payments"]
+        .as_array()
+        .context("Expected MDK payments JSON")?;
+    let matches: Vec<_> = records
+        .iter()
+        .filter(|r| {
+            r["destination"] == invoice
+                && r["direction"] == "outbound"
+                && r["status"] == "completed"
+        })
+        .collect();
+    ensure!(
+        matches.len() == 1,
+        "Need exactly one completed outbound MDK payment for this invoice; do not send it again"
+    );
+    let r = matches[0];
+    let amount = r["amountSats"]
+        .as_u64()
+        .and_then(|n| n.checked_mul(1000))
+        .context("Expected a whole base-unit MDK amount")?;
+    Ok(
+        json!({"status":"paid","invoice":r["destination"],"paymentHash":r["paymentHash"],"amountMsat":amount.to_string(),"preimage":r["preimage"]}),
+    )
 }
 async fn pay_lexe(path: &Path, max_fee: u64) -> Result<()> {
     let mut s = load(path)?;
@@ -377,7 +416,40 @@ async fn main() -> Result<()> {
             );
             attach(&cli.state, s, load(&payment_result)?)?;
         }
+        Command::AttachMdk { payments_file } => {
+            let s = load(&cli.state)?;
+            ensure!(
+                s["phase"] == "prepared" || s["phase"] == "payment_attempted",
+                "State already contains a payment"
+            );
+            let result = mdk_result(&s, &load(&payments_file)?)?;
+            attach(&cli.state, s, result)?;
+        }
         Command::Redeem => redeem(&http, &cli.state).await?,
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn lexe_adapter_exports_actual_preimage_not_redacted_display() {
+        let pre = "0001020304050607080900010203040506070809000102030405060708090102";
+        let hash = p::hash(hex::decode(pre).unwrap());
+        let payment: Payment = serde_json::from_value(json!({
+            "index":format!("0000001700000000000-ln_{hash}"),
+            "rail":"invoice","kind":"invoice","direction":"outbound",
+            "hash":hash,"preimage":pre,"amount":"25","fees":"1",
+            "status":"completed","status_msg":"completed",
+            "created_at":1700000000000u64,"updated_at":1700000001000u64
+        }))
+        .unwrap();
+        let result = adapter_result(payment);
+        assert_eq!(result["preimage"], pre);
+        assert_eq!(result["amountMsat"], "25000");
+        assert_eq!(result["feeMsat"], "1000");
+        assert_eq!(result["paymentHash"], hash);
+        assert_eq!(result["status"], "paid");
+    }
 }

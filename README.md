@@ -77,7 +77,18 @@ target/release/x402-client --state /absolute/private/pi-purchase.json attach-res
 target/release/x402-client --state /absolute/private/pi-purchase.json redeem
 ```
 
-Money Dev Kit's [agent wallet documentation](https://docs.moneydevkit.com/agent-wallet) documents `send <destination> [amount]` and `payments`. Its documented `send` example returns a payment hash, which alone is insufficient for x402. Confirm that your installed version exposes the completed payment preimage before paying. We have tested the Lexe adapter; an MDK wallet has not been used in the live integration test. MDK's automatic L402 handling is a different wire protocol and should not be assumed to implement this x402 scheme.
+Money Dev Kit agent-wallet **0.22.0** exposes payment preimages in completed payment records (verified against the published package). After `prepare`, use your funded MDK wallet to pay the validated invoice, then import its payment history:
+
+```sh
+umask 077
+npx @moneydevkit/agent-wallet@0.22.0 send 'THE_VALIDATED_INVOICE' > /absolute/private/mdk-send.json
+npx @moneydevkit/agent-wallet@0.22.0 payments > /absolute/private/mdk-payments.json
+target/release/x402-client --state /absolute/private/pi-purchase.json attach-mdk \
+  --payments-file /absolute/private/mdk-payments.json
+target/release/x402-client --state /absolute/private/pi-purchase.json redeem
+```
+
+If `send` times out, use `payments` to inspect the original payment; never repeat `send` automatically. The adapter requires a completed outbound record whose destination is the original invoice, checks amount and payment hash, and verifies the preimage. Follow your MDK wallet's spending/fee policy; this import command does not initiate or cap wallet spending. The CLI import path is tested with the published record schema; an MDK-funded live payment has not been run. Lexe is the live-tested payer. [MDK docs](https://docs.moneydevkit.com/agent-wallet), [payment record source](https://github.com/moneydevkit/mdk-checkout/blob/main/packages/agent-wallet/src/payment-store.ts).
 
 ## Architecture
 
@@ -155,6 +166,8 @@ cargo test --locked
 ```
 
 Tests cover decimal rounding through 10,000 places, request-binding hashes, strict invoice validation, tampering, expiry/skew boundaries, duplicate JSON keys, HTTP payment flow, concurrent redemption, and replay protection after reopening the database.
+
+Live mainnet verification on September 23, 2026: a separate Lexe wallet paid for 10 and 10,000 decimal places, and both returned successful x402 receipts. The 10,000-place result matched an independent Chudnovsky calculation. Replaying its proof after a Fly machine restart returned `409 duplicate_settlement`, confirming that consumption survived the restart. The hosted skill was checked byte for byte against this repository.
 
 The invoice in the merged x402 spec's original positive fixture omits the BOLT11 feature field. LDK 0.35.0-beta1 rejects it as `InvalidFeatures`. We retain it unchanged under `tests/fixtures` and explicitly test that incompatibility. Positive settlement tests use the same request, signer, amount, preimage and timestamps with a newly signed invoice including the feature flags. The published request-binding hashes match exactly. Production Lexe invoices include features and pass strict LDK validation. We do not weaken invoice checks to accept the example.
 

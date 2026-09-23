@@ -72,5 +72,11 @@ mod tests {
         let s = rounded(10_000);
         assert_eq!(s.len(), 10_002);
         assert!(s.starts_with("3.14159265358979323846264338327950288419716939937510"));
+        // Independently generated with Chudnovsky + Python Decimal at 10,050
+        // digits of precision (730 terms), rounded to 10,000 decimal places.
+        assert_eq!(
+            crate::protocol::hash(&s),
+            "e0d37616874cdfc375254a46833c40b73e197e2e209660a069546f827acac869"
+        );
     }
 }

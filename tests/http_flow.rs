@@ -158,6 +158,128 @@ async fn full_http_flow_and_concurrent_replay() {
         1,
         "Paid retries do not create new invoices"
     );
+    // Exercise the actual CLI's wallet-independent workflow and durable state.
+    let state = dir.path().join("purchase.json");
+    let client_url = format!("{origin}/digits-of-pi?digits=10");
+    let bin = env!("CARGO_BIN_EXE_x402-client");
+    let prepared = tokio::process::Command::new(bin)
+        .arg("--state")
+        .arg(&state)
+        .args(["prepare", "--url", &client_url])
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        prepared.status.success(),
+        "{}",
+        String::from_utf8_lossy(&prepared.stderr)
+    );
+    let prepared: Value = serde_json::from_slice(&prepared.stdout).unwrap();
+    let client_invoice = prepared["invoice"].as_str().unwrap();
+    let pre = mock.proofs.lock().unwrap()[client_invoice].clone();
+    let mut result = json!({"status":"paid","invoice":client_invoice,"paymentHash":prepared["paymentHash"],"amountMsat":"1","feeMsat":"0","preimage":pre});
+    let result_path = dir.path().join("wallet-result.json");
+    std::fs::write(&result_path, serde_json::to_vec(&result).unwrap()).unwrap();
+    let bad = tokio::process::Command::new(bin)
+        .arg("--state")
+        .arg(&state)
+        .args(["attach-result", "--payment-result"])
+        .arg(&result_path)
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        !bad.status.success(),
+        "Must reject a wallet result for the wrong amount"
+    );
+    result["amountMsat"] = json!("100000");
+    std::fs::write(&result_path, serde_json::to_vec(&result).unwrap()).unwrap();
+    let attached = tokio::process::Command::new(bin)
+        .arg("--state")
+        .arg(&state)
+        .args(["attach-result", "--payment-result"])
+        .arg(&result_path)
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        attached.status.success(),
+        "{}",
+        String::from_utf8_lossy(&attached.stderr)
+    );
+    for _ in 0..2 {
+        let redeemed = tokio::process::Command::new(bin)
+            .arg("--state")
+            .arg(&state)
+            .arg("redeem")
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            redeemed.status.success(),
+            "{}",
+            String::from_utf8_lossy(&redeemed.stderr)
+        );
+        let value: Value = serde_json::from_slice(&redeemed.stdout).unwrap();
+        assert_eq!(value["pi"], "3.1415926536");
+    }
+    let repeat = tokio::process::Command::new(bin)
+        .arg("--state")
+        .arg(&state)
+        .args(["prepare", "--url", &client_url])
+        .output()
+        .await
+        .unwrap();
+    assert!(!repeat.status.success());
+    assert_eq!(mock.seq.load(Ordering::SeqCst), 2);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&state).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+    let mdk_state = dir.path().join("mdk-purchase.json");
+    let prepared = tokio::process::Command::new(bin)
+        .arg("--state")
+        .arg(&mdk_state)
+        .args([
+            "prepare",
+            "--url",
+            &format!("{origin}/digits-of-pi?digits=4"),
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert!(prepared.status.success());
+    let prepared: Value = serde_json::from_slice(&prepared.stdout).unwrap();
+    let invoice = prepared["invoice"].as_str().unwrap();
+    let history = json!({"payments":[{"destination":invoice,"direction":"outbound","status":"completed","amountSats":100,"paymentHash":prepared["paymentHash"],"preimage":mock.proofs.lock().unwrap()[invoice]}]});
+    std::fs::write(&result_path, serde_json::to_vec(&history).unwrap()).unwrap();
+    let attached = tokio::process::Command::new(bin)
+        .arg("--state")
+        .arg(&mdk_state)
+        .args(["attach-mdk", "--payments-file"])
+        .arg(&result_path)
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        attached.status.success(),
+        "{}",
+        String::from_utf8_lossy(&attached.stderr)
+    );
+    let redeemed = tokio::process::Command::new(bin)
+        .arg("--state")
+        .arg(&mdk_state)
+        .arg("redeem")
+        .output()
+        .await
+        .unwrap();
+    assert!(redeemed.status.success());
+    let result: Value = serde_json::from_slice(&redeemed.stdout).unwrap();
+    assert_eq!(result["pi"], "3.1416");
     task.abort();
     facilitator.abort();
 }

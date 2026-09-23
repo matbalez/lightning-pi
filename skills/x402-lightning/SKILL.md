@@ -13,6 +13,22 @@ Use within the user's payment authorization. Your wallet must be funded on Bitco
 
 Use the client helper in https://github.com/matbalez/lightning-pi when possible. It validates invoices before payment and preserves state for recovery. See that repository's client instructions for commands and the wallet adapter contract.
 
+## Reference client
+
+Clone the repository and run `cargo build --locked --release --bin x402-client` (Rust 1.95). Use a private state file outside the checkout.
+
+For Lexe, set `LEXE_CLIENT_CREDENTIALS_PATH` to your payer credential file (spend/read_info/read_payments scopes), then:
+
+```sh
+target/release/x402-client --state /absolute/private/pi.json buy \
+  --url 'https://lightning-pi-matbalez.fly.dev/digits-of-pi?digits=100' \
+  --max-amount-msat 100000 --max-fee-msat 10000
+```
+
+For Money Dev Kit agent-wallet 0.22.0, first run the helper's `prepare --url URL` subcommand. Pay only the validated invoice using `npx @moneydevkit/agent-wallet@0.22.0 send INVOICE`, saving output privately. Use `payments` to save the completed payment history to a private JSON file. Run the helper's `attach-mdk --payments-file FILE`, then `redeem`, always with the same `--state` path before the subcommand. The importer verifies the record's destination, completed status, amount, hash and preimage. It does not initiate wallet spending or enforce MDK fee limits. The published MDK record schema has been tested; the live payment test uses Lexe.
+
+On an interrupted Lexe payment, run `recover-lexe` (read-only payment lookup), then `redeem`. On a lost redemption response, run `redeem` again. Never run another `buy` automatically. Do not expose state files, payment history or preimages in chat or public logs.
+
 ## Protocol
 
 1. Send the intended GET over HTTPS with no body and redirects disabled. Save the exact URL, including query string.
@@ -34,6 +50,6 @@ Use the client helper in https://github.com/matbalez/lightning-pi when possible.
 - Preserve the original challenge and proof on connection loss. Retry the same proof only for the exact original request. Never repay to recover a lost response automatically.
 - Proofs are single use. `duplicate_settlement` (HTTP 409) means a previous attempt consumed the proof, potentially before a response was lost. Stop and report this; the demo has no paid-response recovery or automatic refund.
 - Redemption is allowed through invoice expiry plus 60 seconds. After that, report the failure. Lightning payment precedes delivery; overpayment buys no extra credit and no protocol refund is provided.
-- This skill does not make every x402 library Lightning-compatible. For MDK, use its documented BOLT11 payment and lookup interfaces and verify it exposes the preimage. Do not invent an MDK command.
+- This skill does not make every x402 library Lightning-compatible. MDK's automatic L402 handling uses different headers; use the explicit x402 flow above.
 
 Specification: https://github.com/x402-foundation/x402/blob/main/specs/schemes/exact/scheme_exact_lnbtc.md
