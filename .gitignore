@@ -1,0 +1,12 @@
+/target/
+/.env
+/.env.*
+!/.env.example
+/data/
+*.sqlite*
+*.log
+*credentials*
+*seedphrase*
+*preimage*
+/wallet/
+
