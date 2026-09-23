@@ -131,7 +131,54 @@ fn response(status: StatusCode, value: Value) -> Response {
     r
 }
 fn error(status: StatusCode, reason: &str) -> Response {
-    response(status, json!({"error":reason}))
+    response(status, error_body(reason))
+}
+fn error_body(reason: &str) -> Value {
+    // Preserve the spec's stable codes. Give agents actionable context without
+    // echoing invoices, preimages, or other submitted payment data.
+    let help = match reason {
+        "invalid_exact_lnbtc_preimage_hash_mismatch" => Some((
+            "The preimage does not match the invoice in PAYMENT-SIGNATURE.accepted.extra.invoice.",
+            "Reuse the saved accepts entry from the challenge whose invoice you paid. A fresh unpaid GET creates a different invoice; do not combine its challenge with the original payment proof or pay again automatically.",
+        )),
+        "invalid_exact_lnbtc_pay_to_mismatch" => Some((
+            "PAYMENT-SIGNATURE.accepted.payTo differs from this service's configured receiving node.",
+            "Copy the entire original accepts entry into accepted, preserving payTo and extra.invoice. Do not use the whole PAYMENT-REQUIRED object or an accepts array. This code identifies a recipient-field mismatch, not a preimage mismatch.",
+        )),
+        "invalid_exact_lnbtc_invoice_payee_mismatch" => Some((
+            "The invoice signing key does not match accepted.payTo.",
+            "Restore the original accepted entry intact. Do not combine an invoice with fields copied from another challenge.",
+        )),
+        "invalid_exact_lnbtc_request_mismatch" | "invalid_exact_lnbtc_invoice_request_mismatch" => {
+            Some((
+                "The submitted challenge or invoice is bound to a different request.",
+                "Retry the exact saved URL, including its query string, using the original accepted entry and payment proof.",
+            ))
+        }
+        "invalid_exact_lnbtc_preimage_missing" => Some((
+            "PAYMENT-SIGNATURE.payload.preimage is missing.",
+            "Use {x402Version: 2, accepted: ORIGINAL_ACCEPTS_ENTRY, payload: {preimage: HEX}}. The preimage comes from your completed wallet payment, not the invoice or payment hash.",
+        )),
+        "invalid_exact_lnbtc_invoice_expired" => Some((
+            "The original invoice's redemption window has expired.",
+            "Keep the original challenge and payment record. Fetching a new challenge cannot renew an already paid invoice; do not pay again automatically.",
+        )),
+        "duplicate_settlement" => Some((
+            "This invoice's payment proof has already been consumed.",
+            "Use your saved successful result if available. If the response was lost, report the failure; this service has no paid-response recovery. Do not pay again automatically.",
+        )),
+        "invalid_payment_payload" => Some((
+            "PAYMENT-SIGNATURE must be base64-encoded JSON with no duplicate keys.",
+            "Use {x402Version: 2, accepted: ORIGINAL_ACCEPTS_ENTRY, payload: {preimage: HEX}}. Send standard base64, not raw JSON or an L402 Authorization header.",
+        )),
+        _ => None,
+    };
+    let mut body = json!({"error":reason});
+    if let Some((message, hint)) = help {
+        body["message"] = json!(message);
+        body["hint"] = json!(hint);
+    }
+    body
 }
 fn rate_error() -> Response {
     let mut r = error(StatusCode::TOO_MANY_REQUESTS, "busy_retry_later");
@@ -236,7 +283,9 @@ async fn digits(
             } else {
                 StatusCode::PAYMENT_REQUIRED
             };
-            let mut r = response(status, json!({"error":reason,"payment":settlement}));
+            let mut body = error_body(reason);
+            body["payment"] = settlement.clone();
+            let mut r = response(status, body);
             r.headers_mut().insert(
                 "payment-response",
                 HeaderValue::from_str(&p::encode(&settlement)).unwrap(),

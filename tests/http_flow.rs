@@ -116,6 +116,64 @@ async fn full_http_flow_and_concurrent_replay() {
     let pre = mock.proofs.lock().unwrap()[invoice].clone();
     let payload = json!({"x402Version":2,"accepted":accepted,"payload":{"preimage":pre}});
     let signature = p::encode(&payload);
+    // Reproduce the agent's mistake: invoice A's proof with a fresh challenge B.
+    let second = http.get(&url).send().await.unwrap();
+    let second = p::decode(second.headers()["payment-required"].to_str().unwrap()).unwrap();
+    assert_ne!(
+        second["accepts"][0]["extra"]["invoice"],
+        accepted["extra"]["invoice"]
+    );
+    let mut mixed = payload.clone();
+    mixed["accepted"] = second["accepts"][0].clone();
+    let mismatch = http
+        .get(&url)
+        .header("payment-signature", p::encode(&mixed))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(mismatch.status(), 402);
+    assert!(mismatch.headers().get("payment-required").is_none());
+    let failed_receipt =
+        p::decode(mismatch.headers()["payment-response"].to_str().unwrap()).unwrap();
+    let body = mismatch.json::<Value>().await.unwrap();
+    assert_eq!(body["error"], "invalid_exact_lnbtc_preimage_hash_mismatch");
+    assert_eq!(failed_receipt["errorReason"], body["error"]);
+    assert_eq!(failed_receipt, body["payment"]);
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .contains("does not match the invoice")
+    );
+    assert!(
+        body["hint"]
+            .as_str()
+            .unwrap()
+            .contains("saved accepts entry")
+    );
+    assert!(!body.to_string().contains(&pre));
+    assert!(!body.to_string().contains(invoice));
+    let mut wrong_payee = payload.clone();
+    wrong_payee["accepted"]["payTo"] = json!(
+        PublicKey::from_secret_key(&Secp256k1::new(), &SecretKey::from_slice(&[4; 32]).unwrap())
+            .to_string()
+    );
+    let wrong_payee = http
+        .get(&url)
+        .header("payment-signature", p::encode(&wrong_payee))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong_payee.status(), 402);
+    let body = wrong_payee.json::<Value>().await.unwrap();
+    assert_eq!(body["error"], "invalid_exact_lnbtc_pay_to_mismatch");
+    assert!(body["message"].as_str().unwrap().contains("accepted.payTo"));
+    assert!(
+        body["hint"]
+            .as_str()
+            .unwrap()
+            .contains("not a preimage mismatch")
+    );
     let wrong = http
         .get(format!("{origin}/digits-of-pi?digits=4"))
         .header("payment-signature", &signature)
@@ -155,7 +213,7 @@ async fn full_http_flow_and_concurrent_replay() {
     assert_eq!(good.json::<Value>().await.unwrap()["pi"], "3.142");
     assert_eq!(
         mock.seq.load(Ordering::SeqCst),
-        1,
+        2,
         "Paid retries do not create new invoices"
     );
     // Exercise the actual CLI's wallet-independent workflow and durable state.
@@ -231,7 +289,7 @@ async fn full_http_flow_and_concurrent_replay() {
         .await
         .unwrap();
     assert!(!repeat.status.success());
-    assert_eq!(mock.seq.load(Ordering::SeqCst), 2);
+    assert_eq!(mock.seq.load(Ordering::SeqCst), 3);
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -280,6 +338,75 @@ async fn full_http_flow_and_concurrent_replay() {
     assert!(redeemed.status.success());
     let result: Value = serde_json::from_slice(&redeemed.stdout).unwrap();
     assert_eq!(result["pi"], "3.1416");
+
+    // Execute the exact Python snippets agents read, against the signed-invoice
+    // mock service. The wallet step is simulated; invoice validation is above.
+    let skill = include_str!("../skills/x402-lightning/SKILL.md");
+    let snippets: Vec<_> = skill
+        .split("```python\n")
+        .skip(1)
+        .map(|block| block.split("```").next().unwrap())
+        .collect();
+    assert_eq!(snippets.len(), 2);
+    let capture = snippets[0].replace("https://lightning-pi-matbalez.fly.dev", &origin);
+    let saved_challenge = dir.path().join("challenge.json");
+    let count_before = mock.seq.load(Ordering::SeqCst);
+    let captured = tokio::process::Command::new("python3")
+        .args(["-c", &capture])
+        .current_dir(dir.path())
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        captured.status.success(),
+        "{}",
+        String::from_utf8_lossy(&captured.stderr)
+    );
+    let saved_bytes = std::fs::read(&saved_challenge).unwrap();
+    let saved: Value = serde_json::from_slice(&saved_bytes).unwrap();
+    assert_eq!(saved["url"], format!("{origin}/digits-of-pi?digits=25"));
+    let repeated = tokio::process::Command::new("python3")
+        .args(["-c", &capture])
+        .current_dir(dir.path())
+        .output()
+        .await
+        .unwrap();
+    assert!(!repeated.status.success());
+    assert_eq!(std::fs::read(&saved_challenge).unwrap(), saved_bytes);
+    assert_eq!(mock.seq.load(Ordering::SeqCst), count_before + 1);
+    let invoice = saved["accepted"]["extra"]["invoice"].as_str().unwrap();
+    let pre = mock.proofs.lock().unwrap()[invoice].clone();
+    let payment = json!({"status":"paid","invoice":invoice,"amountMsat":"100000",
+        "paymentHash":p::hash(hex::decode(&pre).unwrap()),"preimage":pre});
+    std::fs::write(
+        dir.path().join("wallet-result.json"),
+        serde_json::to_vec(&payment).unwrap(),
+    )
+    .unwrap();
+    let redeemed = tokio::process::Command::new("python3")
+        .args(["-c", snippets[1]])
+        .current_dir(dir.path())
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        redeemed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&redeemed.stderr)
+    );
+    let result: Value = serde_json::from_slice(&redeemed.stdout).unwrap();
+    assert_eq!(result["pi"], "3.1415926535897932384626434");
+    assert_eq!(mock.seq.load(Ordering::SeqCst), count_before + 1);
+    let replayed = tokio::process::Command::new("python3")
+        .args(["-c", snippets[1]])
+        .current_dir(dir.path())
+        .output()
+        .await
+        .unwrap();
+    assert!(!replayed.status.success());
+    assert!(String::from_utf8_lossy(&replayed.stderr).contains("duplicate_settlement"));
+    assert!(!String::from_utf8_lossy(&replayed.stderr).contains(&pre));
+    assert_eq!(mock.seq.load(Ordering::SeqCst), count_before + 1);
     task.abort();
     facilitator.abort();
 }

@@ -19,9 +19,13 @@ curl -i 'https://lightning-pi-matbalez.fly.dev/digits-of-pi?digits=3'
 
 The HTTP 402 response carries the canonical base64 JSON `PAYMENT-REQUIRED` header. Its JSON body mirrors that challenge for inspection. Each unpaid call creates a fresh BOLT11 invoice. This is a live mainnet service.
 
+**Save the entire selected `accepts` entry and exact URL before paying.** The paid retry's `accepted` object must preserve that entry, including its original invoice. Fetching another challenge gives you a different invoice, which cannot be paired with the first payment's preimage. The original proof remains redeemable with its saved challenge until expiry/grace; never pay again automatically to repair a header.
+
 ## Pay with an agent
 
 Give the agent the [SKILL.md](skills/x402-lightning/SKILL.md) and access to its own funded Lightning wallet. That wallet must return a payment preimage. The server never needs the payer's credentials.
+
+For agents scripting HTTP directly, the skill includes a [manual Python handshake](skills/x402-lightning/SKILL.md#manual-http-handshake-in-python): persist the challenge, validate/pay its invoice with your wallet, then construct the exact `PAYMENT-SIGNATURE` envelope from the saved entry. These transport snippets complement the required invoice validation; the Rust client below implements that validation.
 
 The reference client uses the same strict invoice and request validation as the service:
 
@@ -123,6 +127,7 @@ sequenceDiagram
 - The facilitator runs on **127.0.0.1:8081**, outside Fly's public service port, and never queries the receiving node. It verifies the preimage locally and stores `network:payment_hash` atomically in SQLite with WAL and `synchronous=FULL`.
 - Entries remain until more than one hour past invoice expiry plus grace. The Fly volume preserves them through process and machine restarts. Keep **one machine** with this volume. Multiple machines require a shared strongly consistent settlement database. Do not restore a stale snapshot while older proofs can still be valid.
 - Requests are executed only after settlement succeeds. Concurrent use of a proof yields one result and one `duplicate_settlement` error. The service uses HTTP 409 for that error.
+- Paid failure responses retain the specification's stable error codes and settlement receipt, with additional `message` and `hint` fields for common mistakes. A preimage/invoice mismatch and a recipient-field mismatch receive different explanations. Validation failures do not consume the proof or create a replacement invoice.
 - Invoice creation is limited to four concurrent calls and 120 challenges per minute globally; paid work has a separate concurrency limit.
 - Pi uses integer interval arithmetic and Machin's formula. It checks that both error bounds round identically, avoiding floating-point precision loss.
 
@@ -166,6 +171,8 @@ cargo test --locked
 ```
 
 Tests cover decimal rounding through 10,000 places, request-binding hashes, strict invoice validation, tampering, expiry/skew boundaries, duplicate JSON keys, HTTP payment flow, concurrent redemption, and replay protection after reopening the database.
+
+The HTTP integration test also executes the Python snippets directly from the skill (Python 3 required), verifies that challenge files cannot be overwritten, and reproduces mixing invoice A's proof with challenge B. Failed validation leaves the original proof usable, with no new invoice created.
 
 Live mainnet verification on September 23, 2026: a separate Lexe wallet paid for 10 and 10,000 decimal places, and both returned successful x402 receipts. The 10,000-place result matched an independent Chudnovsky calculation. Replaying its proof after a Fly machine restart returned `409 duplicate_settlement`, confirming that consumption survived the restart. The hosted skill was checked byte for byte against this repository.
 
